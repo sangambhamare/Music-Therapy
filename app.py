@@ -1,88 +1,141 @@
 import streamlit as st
+import numpy as np
 import os
 import tempfile
-import urllib.request
-import note_seq
-import tensorflow.compat.v1 as tf
-tf.disable_v2_behavior()
 
-from magenta.models.melody_rnn import melody_rnn_sequence_generator
-from magenta.models.shared import sequence_generator_bundle
-from magenta.protobuf import generator_pb2
+# Using TensorFlow's Keras API to load the pretrained DeepJazz model.
+from tensorflow.keras.models import load_model
+from midiutil import MIDIFile
 
-# Cache the model loading to speed up subsequent runs.
+# ---------------------------------------------------
+# Helper: Load the pretrained model (DeepJazz)
+# ---------------------------------------------------
 @st.cache(allow_output_mutation=True)
-def load_model():
-    bundle_path = 'basic_rnn.mag'
-    if not os.path.exists(bundle_path):
-        st.info("Downloading pre-trained model bundle...")
-        url = 'https://storage.googleapis.com/magentadata/models/melody_rnn/basic_rnn.mag'
-        urllib.request.urlretrieve(url, bundle_path)
-    bundle = sequence_generator_bundle.read_bundle_file(bundle_path)
-    generator_map = melody_rnn_sequence_generator.get_generator_map()
-    model = generator_map['basic_rnn'](checkpoint=None, bundle=bundle)
-    model.initialize()
+def load_deepjazz_model():
+    model_path = 'deepjazz.h5'
+    if not os.path.exists(model_path):
+        st.error("Pretrained model file 'deepjazz.h5' not found. Please add it to your repository.")
+        return None
+    model = load_model(model_path)
     return model
 
+# ---------------------------------------------------
+# Helper: Map heart rate to generation parameters.
+# ---------------------------------------------------
 def get_music_params_from_heart_rate(heart_rate):
     """
-    Map heart rate to music generation parameters.
+    For demonstration purposes, a higher heart rate returns a lower temperature (calmer output)
+    and a longer generated sequence, while a lower heart rate returns a higher temperature.
     """
     if heart_rate > 100:
-        temperature = 0.5      # Calmer music
-        primer_pitch = 60      # Middle C
-        gen_end_time = 30      # Longer piece for sustained therapy
+        temperature = 0.5  # Less randomness = calmer music
+        sequence_length = 100  # More notes (longer piece)
     elif heart_rate < 60:
-        temperature = 1.2      # More variation
-        primer_pitch = 72      # Brighter note (C5)
-        gen_end_time = 20      # Shorter piece
+        temperature = 1.2  # More randomness
+        sequence_length = 50   # Fewer notes
     else:
-        temperature = 0.8      # Balanced parameters
-        primer_pitch = 64      # E note
-        gen_end_time = 25
-    return temperature, primer_pitch, gen_end_time
+        temperature = 0.8
+        sequence_length = 75
+    return temperature, sequence_length
 
-def generate_music(model, heart_rate):
-    # Map the heart rate to generation parameters.
-    temperature, primer_pitch, gen_end_time = get_music_params_from_heart_rate(heart_rate)
-    st.write(f"Using parameters: Temperature = {temperature}, Primer Pitch = {primer_pitch}, Generation End Time = {gen_end_time}s")
+# ---------------------------------------------------
+# Helper: Sample a note index using temperature.
+# ---------------------------------------------------
+def sample(preds, temperature=1.0):
+    preds = np.asarray(preds).astype("float64")
+    preds = np.log(preds + 1e-7) / temperature
+    exp_preds = np.exp(preds)
+    preds = exp_preds / np.sum(exp_preds)
+    probas = np.random.multinomial(1, preds, 1)
+    return np.argmax(probas)
+
+# ---------------------------------------------------
+# Helper: Generate music using the pretrained model.
+# ---------------------------------------------------
+def generate_music(model, temperature, sequence_length, seed=None):
+    """
+    This function assumes:
+      - The model was trained on sequences of length 'maxlen'
+      - The output of the model is a probability distribution over a vocabulary (here assumed to be 128 MIDI notes)
+    """
+    maxlen = 50   # Input sequence length expected by the model
+    vocab_size = 128  # MIDI note range 0-127
+
+    # If no seed is provided, generate a random seed sequence.
+    if seed is None:
+        seed = np.random.randint(0, vocab_size, size=(maxlen,))
     
-    # Create a primer NoteSequence (seed note).
-    primer_sequence = note_seq.NoteSequence()
-    primer_sequence.notes.add(pitch=primer_pitch, start_time=0.0, end_time=0.5, velocity=80)
-    primer_sequence.total_time = 1.0
+    generated = list(seed)
+    
+    # Generate notes one at a time.
+    for i in range(sequence_length):
+        # Prepare one-hot encoded input of shape (1, maxlen, vocab_size)
+        x_pred = np.zeros((1, maxlen, vocab_size))
+        for t, note in enumerate(seed):
+            x_pred[0, t, note] = 1.0
+        
+        # Predict next note distribution.
+        preds = model.predict(x_pred, verbose=0)[0]  # Expected shape: (vocab_size,)
+        next_index = sample(preds, temperature)
+        
+        generated.append(next_index)
+        # Slide the seed window forward.
+        seed = np.append(seed[1:], next_index)
+    
+    return generated
 
-    # Configure generation options.
-    generator_options = generator_pb2.GeneratorOptions()
-    generator_options.generate_sections.add(
-        start_time=primer_sequence.total_time,
-        end_time=gen_end_time
-    )
-    generator_options.args['temperature'].float_value = temperature
+# ---------------------------------------------------
+# Helper: Convert a note sequence to a MIDI file.
+# ---------------------------------------------------
+def sequence_to_midi(note_sequence, tempo=120):
+    midi = MIDIFile(1)  # One track MIDI file
+    track = 0
+    time = 0  # Start time in beats
+    midi.addTempo(track, time, tempo)
+    
+    channel = 0
+    duration = 1  # Duration (in beats) for each note
+    volume = 100  # Volume for each note
+    for note in note_sequence:
+        # Only add valid MIDI notes.
+        if 0 <= note < 128:
+            midi.addNote(track, channel, note, time, duration, volume)
+            time += duration
+    return midi
 
-    # Generate the music.
-    generated_sequence = model.generate(primer_sequence, generator_options)
-    return generated_sequence
+def save_midi(midi, file_path):
+    with open(file_path, "wb") as output_file:
+        midi.writeFile(output_file)
 
+# ---------------------------------------------------
+# Main Streamlit App
+# ---------------------------------------------------
 def main():
-    st.title("Music Therapy Generator")
-    st.write("Enter your biometric data to generate personalized music.")
-
-    # Input field for the user's heart rate.
+    st.title("DeepJazz Music Generator")
+    st.write("Generate personalized jazz music using a pretrained DeepJazz model. "
+             "Your heart rate input will adjust the generation parameters.")
+    
+    # Input: Manual biometric (heart rate) entry.
     heart_rate = st.number_input("Enter your Heart Rate (bpm):", min_value=30, max_value=200, value=70, step=1)
-
+    
     if st.button("Generate Music"):
-        model = load_model()
-        st.write("Generating your personalized music...")
-        generated_sequence = generate_music(model, heart_rate)
-
-        # Save the generated NoteSequence as a MIDI file in a temporary file.
+        model = load_deepjazz_model()
+        if model is None:
+            return
+        
+        temperature, sequence_length = get_music_params_from_heart_rate(heart_rate)
+        st.write(f"Using parameters: Temperature = {temperature}, Sequence Length = {sequence_length} notes")
+        
+        with st.spinner("Generating music..."):
+            generated_sequence = generate_music(model, temperature, sequence_length)
+        
+        # Convert generated note sequence to MIDI.
+        midi = sequence_to_midi(generated_sequence)
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mid") as tmp_file:
             midi_path = tmp_file.name
-        note_seq.sequence_proto_to_midi_file(generated_sequence, midi_path)
-
-        st.success("Music generation complete!")
-        # Provide a download button for the MIDI file.
+        save_midi(midi, midi_path)
+        
+        st.success("Music generated successfully!")
         with open(midi_path, "rb") as f:
             midi_bytes = f.read()
         st.download_button(
