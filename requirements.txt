@@ -1,4 +1,1 @@
-streamlit==1.15.2
-tensorflow  # or tensorflow-cpu, as appropriate
-midiutil
-altair==4.2.0
+streamlit
