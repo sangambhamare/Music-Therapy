@@ -1,4 +1,3 @@
-streamlit
-tensorflow-cpu
-magenta
-note_seq
+streamlit==1.15.2
+tensorflow  # You can let pip pick an appropriate version (ideally TensorFlow 2.x)
+midiutil
