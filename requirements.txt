@@ -1,3 +1,4 @@
 streamlit==1.15.2
-tensorflow  # You can let pip pick an appropriate version (ideally TensorFlow 2.x)
+tensorflow  # or tensorflow-cpu, as appropriate
 midiutil
+altair==4.2.0
